@@ -99,6 +99,7 @@ private:
   double degeneracy_cov_ramp_ = 5.0;
   double degeneracy_cov_scale_ = 1.0;
   double degeneracy_cov_offset_ = 0.0;
+  double degeneracy_threshold_ = 1.0;
 
   tf2::Transform base_from_laser_;  // static, cached
   tf2::Transform laser_from_base_;
