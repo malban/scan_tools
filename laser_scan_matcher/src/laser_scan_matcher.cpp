@@ -52,6 +52,7 @@ LaserScanMatcher::LaserScanMatcher() : rclcpp::Node("laser_scan_matcher") {
   base_frame_ = param("base_frame", std::string("base_link"), "Which frame to use for the robot base");
   odom_frame_ = param("odom_frame", std::string("odom"), "Which frame to track odometry in");
   publish_tf_ =  param("publish_tf", true, "Whether to publish tf transform from 'odom_frame' to 'base_frame'");
+  bool run_at_startup =  param("run_at_startup", false, "Start in active mode");
 
   // dynamic parameters
   register_param(&tf_timeout_, "tf_timeout", 0.1, "TF timeout in seconds.", 0.0, 10.0);
@@ -129,6 +130,10 @@ LaserScanMatcher::LaserScanMatcher() : rclcpp::Node("laser_scan_matcher") {
   stop_srv_ = create_service<std_srvs::srv::Trigger>(
     "~/stop",
     std::bind(&LaserScanMatcher::stopCallback, this, std::placeholders::_1, std::placeholders::_2));
+
+  if (run_at_startup) {
+    start();
+  }
 }
 
 rcl_interfaces::msg::SetParametersResult LaserScanMatcher::parametersCallback(
@@ -679,6 +684,16 @@ Eigen::Matrix2f LaserScanMatcher::getLaserRotation(const tf2::Transform& odom_po
   return t.toRotationMatrix();
 }
 
+void LaserScanMatcher::start() {
+  if (is_running_) {
+    return;
+  }
+  is_running_ = true;
+
+  scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
+    "scan", rclcpp::SensorDataQoS(), std::bind(&LaserScanMatcher::scanCallback, this, std::placeholders::_1));
+}
+
 void LaserScanMatcher::startCallback(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
                                      std::shared_ptr<std_srvs::srv::Trigger::Response> resp)
 {
@@ -687,18 +702,13 @@ void LaserScanMatcher::startCallback(const std::shared_ptr<std_srvs::srv::Trigge
     resp->success = false;
     return;
   }
-  scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
-    "scan", rclcpp::SensorDataQoS(), std::bind(&LaserScanMatcher::scanCallback, this, std::placeholders::_1));
-  is_running_ = true;
+
+  start();
   resp->success = true;
 }
 
-void LaserScanMatcher::stopCallback(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
-                                    std::shared_ptr<std_srvs::srv::Trigger::Response> resp)
-{
+void LaserScanMatcher::stop() {
   if(!is_running_){
-    resp->message = "Scan matching is not running, so it cannot be stopped.";
-    resp->success = false;
     return;
   }
 
@@ -716,8 +726,20 @@ void LaserScanMatcher::stopCallback(const std::shared_ptr<std_srvs::srv::Trigger
   output_.dx_dy1_m = nullptr;
   output_.dx_dy2_m = nullptr;
   initialized_ = false;
-  
+
   is_running_ = false;
+}
+
+void LaserScanMatcher::stopCallback(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
+                                    std::shared_ptr<std_srvs::srv::Trigger::Response> resp)
+{
+  if(!is_running_){
+    resp->message = "Scan matching is not running, so it cannot be stopped.";
+    resp->success = false;
+    return;
+  }
+
+  stop();
   resp->success = true;
 }
 

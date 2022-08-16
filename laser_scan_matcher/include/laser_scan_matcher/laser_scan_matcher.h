@@ -203,8 +203,12 @@ private:
   bool processScan(const sensor_msgs::msg::LaserScan::SharedPtr scan_msg, const tf2::Transform& pred_laser_offset);
   void laserScanToLDP(const sensor_msgs::msg::LaserScan::SharedPtr& scan, LDP& ldp);
   void createTfFromXYTheta(double x, double y, double theta, tf2::Transform& t);
+
+  void start();
   void startCallback(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
       std::shared_ptr<std_srvs::srv::Trigger::Response> resp);
+
+  void stop();
   void stopCallback(const std::shared_ptr<std_srvs::srv::Trigger::Request> req,
       std::shared_ptr<std_srvs::srv::Trigger::Response> resp);
 
