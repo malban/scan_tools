@@ -496,7 +496,10 @@ bool LaserScanMatcher::processScan(
     tf_broadcaster_->sendTransform (tf_msg);
   }
 
-  if (newKeyframeNeeded(corr_ch)) {
+  // get the adjusted offset of the current frame from the keyframe
+  tf2::Transform adjusted_offset = keyframe_base_in_fixed_.inverse() * base_in_fixed_;
+
+  if (newKeyframeNeeded(adjusted_offset)) {
     RCLCPP_INFO(get_logger(),"Creating new keyframe ...");
     // generate a keyframe
     ld_free(keyframe_laser_data_);
