@@ -110,6 +110,16 @@ class LaserScanMatcher
     bool publish_pose_with_covariance_stamped_;
     std::vector<double> position_covariance_;
     std::vector<double> orientation_covariance_;
+    double xy_cov_scale_;
+    double xy_cov_offset_;
+    double heading_cov_scale_;
+    double heading_cov_offset_;
+    bool degeneracy_check_;
+    double degeneracy_threshold_;
+    double degeneracy_baseline_;
+    double degeneracy_cov_ramp_;
+    double degeneracy_cov_scale_;
+    double degeneracy_cov_offset_;
 
     bool use_cloud_input_;
 
@@ -195,6 +205,8 @@ class LaserScanMatcher
     void createTfFromXYTheta(double x, double y, double theta, tf::Transform& t);
 
     Eigen::Matrix2f getLaserRotation(const tf::Transform& odom_pose) const;
+
+    Eigen::Vector2f checkAxisDegeneracy(const laser_data& scan, float baseline) const;
 };
 
 } // namespace scan_tools

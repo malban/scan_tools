@@ -222,6 +222,20 @@ void LaserScanMatcher::initParams()
     orientation_covariance_.resize(3);
     std::fill(orientation_covariance_.begin(), orientation_covariance_.end(), 1e-9);
   }
+
+  xy_cov_scale_ = nh_private_.param("xy_cov_scale", 1.0);
+  xy_cov_offset_ = nh_private_.param("xy_cov_offset", 0.0);
+  heading_cov_scale_ = nh_private_.param("heading_cov_scale", 1.0);
+  heading_cov_offset_ = nh_private_.param("heading_cov_offset", 0.0);
+
+  // degeneracy parameters
+  degeneracy_check_ = nh_private_.param("degeneracy_check", false);
+  degeneracy_threshold_ = nh_private_.param("degeneracy_threshold", 0.7);
+  degeneracy_baseline_ = nh_private_.param("degeneracy_baseline", 0.2);
+  degeneracy_cov_ramp_ = nh_private_.param("degeneracy_cov_ramp", 5.0);
+  degeneracy_cov_scale_ = nh_private_.param("degeneracy_cov_scale", 5.0);
+  degeneracy_cov_offset_ = nh_private_.param("degeneracy_cov_offset", 0.1);
+
   // **** CSM parameters - comments copied from algos.h (by Andrea Censi)
 
   // Maximum angular displacement between scans
@@ -490,6 +504,12 @@ void LaserScanMatcher::processScan(LDP& curr_ldp_scan, const ros::Time& time)
     output_.dx_dy2_m = 0;
   }
 
+  ROS_DEBUG("predicted offset: %lf, %lf", pred_last_base_offset.getOrigin().getX(),
+    pred_last_base_offset.getOrigin().getY());
+
+  ROS_DEBUG("predicted position: %lf, %lf", pred_base_in_fixed.getOrigin().getX(),
+    pred_base_in_fixed.getOrigin().getY());
+
   // *** scan match - using point to line icp from CSM
 
   sm_icp(&input_, &output_);
@@ -508,6 +528,9 @@ void LaserScanMatcher::processScan(LDP& curr_ldp_scan, const ros::Time& time)
     // calculate the measured pose of the scan in the fixed frame
     last_base_in_fixed_ = keyframe_base_in_fixed_ * meas_keyframe_base_offset;
 
+    ROS_DEBUG("measured position: %lf, %lf", last_base_in_fixed_.getOrigin().getX(),
+      last_base_in_fixed_.getOrigin().getY());
+
     // **** publish
 
     Eigen::Matrix2f xy_cov = Eigen::Matrix2f::Zero();
@@ -515,14 +538,14 @@ void LaserScanMatcher::processScan(LDP& curr_ldp_scan, const ros::Time& time)
     if (input_.do_compute_covariance)
     {
       // get covariance from ICP
-      xy_cov(0, 0) = gsl_matrix_get(output_.cov_x_m, 0, 0);
-      xy_cov(0, 1) = gsl_matrix_get(output_.cov_x_m, 0, 1);
-      xy_cov(1, 0) = gsl_matrix_get(output_.cov_x_m, 1, 0);
-      xy_cov(1, 1) = gsl_matrix_get(output_.cov_x_m, 1, 1);
-      yaw_cov = gsl_matrix_get(output_.cov_x_m, 2, 2);
+      xy_cov(0, 0) = gsl_matrix_get(output_.cov_x_m, 0, 0) * xy_cov_scale_ + xy_cov_offset_;
+      xy_cov(0, 1) = gsl_matrix_get(output_.cov_x_m, 0, 1) * xy_cov_scale_;
+      xy_cov(1, 0) = gsl_matrix_get(output_.cov_x_m, 1, 0) * xy_cov_scale_;
+      xy_cov(1, 1) = gsl_matrix_get(output_.cov_x_m, 1, 1) * xy_cov_scale_ + xy_cov_offset_;
+      yaw_cov = gsl_matrix_get(output_.cov_x_m, 2, 2) * heading_cov_scale_ + heading_cov_offset_;
 
       // rotate xy covariance from the keyframe into odom frame
-      auto rotation = getLaserRotation(f2b_kf_);
+      auto rotation = getLaserRotation(keyframe_base_in_fixed_);
       xy_cov = rotation * xy_cov * rotation.transpose();
     }
     else {
@@ -530,6 +553,57 @@ void LaserScanMatcher::processScan(LDP& curr_ldp_scan, const ros::Time& time)
       xy_cov(1, 1) = position_covariance_[1];
       yaw_cov = orientation_covariance_[2];
     }
+
+    // degeneracy check covariance
+    if (degeneracy_check_) {
+      auto degenerate_axis = checkAxisDegeneracy(*curr_ldp_scan, degeneracy_baseline_);
+      float degeneracy = degenerate_axis.norm();
+      ROS_DEBUG("degeneracy: %f", degeneracy);
+      Eigen::Matrix2f degenerate_cov = Eigen::Matrix2f::Zero();
+      if (degeneracy == 0) {
+        // error condition, set degenerate covariance for both axes
+        ROS_WARN("Setting both axes as degenerate!");
+        degenerate_cov(0, 0) = degeneracy_cov_scale_ + degeneracy_cov_offset_;
+        degenerate_cov(1, 1) = degeneracy_cov_scale_ + degeneracy_cov_offset_;
+
+        // set the pose to the predicted pose instead of the corrected pose
+        last_base_in_fixed_ = pred_base_in_fixed;
+      }
+      else {
+        // scale the degenerate axis
+        Eigen::Vector2f degenerate_axis_scaled = degenerate_axis * std::pow(degeneracy, degeneracy_cov_ramp_) * degeneracy_cov_scale_;
+        Eigen::Vector2f degenerate_axis_offset = degenerate_axis.normalized() * degeneracy_cov_offset_;
+        degenerate_axis = degenerate_axis_scaled + degenerate_axis_offset;
+
+        // create covariance matrix
+        degenerate_cov = degenerate_axis * degenerate_axis.transpose();
+
+        // rotate into odom frame
+        auto rotation = getLaserRotation(last_base_in_fixed_);
+        degenerate_cov = rotation * degenerate_cov * rotation.transpose();
+      }
+
+      xy_cov += degenerate_cov;
+
+      if (degeneracy >= degeneracy_threshold_) {
+        ROS_DEBUG("degeneracy %lf >= %lf", degeneracy, degeneracy_threshold_);
+        // degenerate (and also the valid) axis is in the laser's coordinate frame
+        auto laser_valid_axis = Eigen::Vector2f(degenerate_axis.y(), -degenerate_axis.x()).normalized();
+        // transform the laser_valid axis into the fixed frame
+        const auto rotation  = getLaserRotation(last_base_in_fixed_);
+        Eigen::Vector2f eig_fixed_valid_axis = rotation * laser_valid_axis;
+        auto fixed_valid_axis = tf::Vector3(eig_fixed_valid_axis(0), eig_fixed_valid_axis(1), 0).normalized();
+
+        // project correction onto the valid axis to remove any offset from the
+        // prediction in the degenerate direction
+        tf::Vector3 correction = last_base_in_fixed_.getOrigin() - pred_base_in_fixed.getOrigin();
+        tf::Vector3 adjusted_correction = correction.dot(fixed_valid_axis) * fixed_valid_axis;
+        last_base_in_fixed_.setOrigin(pred_base_in_fixed.getOrigin() + adjusted_correction);
+        ROS_DEBUG("adjusted position: %lf, %lf", last_base_in_fixed_.getOrigin().getX(),
+          last_base_in_fixed_.getOrigin().getY());
+      }
+    }
+
 
     if (publish_pose_)
     {
@@ -598,28 +672,41 @@ void LaserScanMatcher::processScan(LDP& curr_ldp_scan, const ros::Time& time)
       tf::StampedTransform transform_msg (last_base_in_fixed_, time, fixed_frame_, base_frame_);
       tf_broadcaster_.sendTransform (transform_msg);
     }
+
+    // **** swap old and new
+    if (newKeyframeNeeded(meas_keyframe_base_offset))
+    {
+      // generate a keyframe
+      ld_free(prev_ldp_scan_);
+      prev_ldp_scan_ = curr_ldp_scan;
+      keyframe_base_in_fixed_ = last_base_in_fixed_;
+    }
+    else
+    {
+      ld_free(curr_ldp_scan);
+    }
+
+    last_icp_time_ = time;
   }
   else
   {
-    meas_keyframe_base_offset.setIdentity();
-    ROS_WARN("Error in scan matching");
-  }
+    ROS_WARN_THROTTLE(1.0, "Error in scan matching");
 
-  // **** swap old and new
-
-  if (newKeyframeNeeded(meas_keyframe_base_offset))
-  {
-    // generate a keyframe
-    ld_free(prev_ldp_scan_);
-    prev_ldp_scan_ = curr_ldp_scan;
-    keyframe_base_in_fixed_ = last_base_in_fixed_;
+    // **** swap old and new
+    if (newKeyframeNeeded(pred_keyframe_base_offset))
+    {
+      // generate a keyframe
+      ld_free(prev_ldp_scan_);
+      prev_ldp_scan_ = curr_ldp_scan;
+      keyframe_base_in_fixed_ = pred_base_in_fixed;
+      last_base_in_fixed_ = pred_base_in_fixed;
+      last_icp_time_ = time;
+    }
+    else
+    {
+      ld_free(curr_ldp_scan);
+    }
   }
-  else
-  {
-    ld_free(curr_ldp_scan);
-  }
-
-  last_icp_time_ = time;
 
   // **** statistics
 
@@ -634,6 +721,11 @@ bool LaserScanMatcher::newKeyframeNeeded(const tf::Transform& d)
   double x = d.getOrigin().getX();
   double y = d.getOrigin().getY();
   if (x*x + y*y > kf_dist_linear_sq_) return true;
+
+  if ((ros::Time::now() - last_icp_time_).toSec() > 1.0) {
+    ROS_WARN("Timeout waiting for valid scan match, creating new keypoint ...");
+    return true;
+  }
 
   return false;
 }
@@ -796,6 +888,12 @@ tf::Transform LaserScanMatcher::getPrediction(const ros::Time& stamp)
   if (use_vel_)
   {
     double dt = (stamp - last_icp_time_).toSec();
+
+    ROS_DEBUG("dt = %lf", dt);
+    ROS_DEBUG("vx = %lf", latest_vel_msg_.linear.x);
+    ROS_DEBUG("vy = %lf", latest_vel_msg_.linear.y);
+    ROS_DEBUG("dx = %lf", dt * latest_vel_msg_.linear.x);
+    ROS_DEBUG("dy = %lf", dt * latest_vel_msg_.linear.y);
     // NOTE: this assumes the velocity is in the base frame and that the base
     //       and laser frames share the same x,y and z axes
     double pr_ch_x = dt * latest_vel_msg_.linear.x;
@@ -803,6 +901,7 @@ tf::Transform LaserScanMatcher::getPrediction(const ros::Time& stamp)
     double pr_ch_a = dt * latest_vel_msg_.angular.z;
 
     createTfFromXYTheta(pr_ch_x, pr_ch_y, pr_ch_a, pred_last_base_offset);
+    ROS_DEBUG("pred offset: %lf, %lf", pred_last_base_offset.getOrigin().x(), pred_last_base_offset.getOrigin().y());
   }
 
   // **** use wheel odometry
@@ -859,12 +958,124 @@ void LaserScanMatcher::createTfFromXYTheta(
 }
 
 Eigen::Matrix2f LaserScanMatcher::getLaserRotation(const tf::Transform& odom_pose) const {
-  tf::Transform laser_in_fixed = odom_pose * laser_to_base_;
+  tf::Transform laser_in_fixed = odom_pose * laser_from_base_;
   tf::Matrix3x3 fixed_from_laser_rot(laser_in_fixed.getRotation());
   double r,p,y;
   fixed_from_laser_rot.getRPY(r, p, y);
   Eigen::Rotation2Df t(y);
   return t.toRotationMatrix();
+}
+
+Eigen::Vector2f LaserScanMatcher::checkAxisDegeneracy(const laser_data& scan, float baseline) const {
+
+  if (!scan.corr) {
+    ROS_WARN("No scan correspondences!");
+    return {0, 0};
+  }
+
+  // get all of the valid points
+  std::vector<Eigen::Vector2f> points;
+  std::vector<int> original_indices;
+  points.reserve(scan.nrays);
+  original_indices.reserve(scan.nrays);
+  for (int i = 0; i < scan.nrays; i++) {
+    if (scan.valid[i]) {
+      points.emplace_back(scan.points[i].p[0], scan.points[i].p[1]);
+      original_indices.push_back(i);
+    }
+  }
+
+  if (points.empty()) {
+    ROS_WARN("No valid points in scan!");
+    return {0, 0};
+  }
+
+  float half_baseline = 0.5f * baseline;
+
+  std::vector<Eigen::Vector2f> normals;
+  normals.reserve(points.size() * 2);
+
+  // compute sequential distance of each valid point in the scan from the first point
+  std::vector<float> distances(points.size(), 0.0f);
+  for (int i = 1; i < points.size(); i++) {
+    distances[i] = distances[i - 1] + (points[i] - points[i - 1]).norm();
+  }
+
+  // calculate the normal vector of each valid point that has a valid correspondence
+  int start_idx = 0;
+  int end_idx = 0;
+  for (int i = 0; i < points.size(); i++) {
+
+    // check if correspondence is valid
+    if (!scan.corr[original_indices[i]].valid) {
+      continue;
+    }
+
+    double current_dist = distances[i];
+
+    // find the interpolated start point to measure the normal of the scan point
+    auto start_pt = points[start_idx];
+    if (current_dist > half_baseline) {
+      float target_dist = current_dist - half_baseline;
+      while (distances[start_idx] < target_dist) {
+        start_idx++;
+      }
+
+      float r = half_baseline - (current_dist - distances[start_idx]);
+      float l = distances[start_idx] - distances[start_idx - 1];
+      float w = r / l;
+      start_pt = points[start_idx - 1] * w + (1.0f - w) * points[start_idx];
+    }
+
+    // find the interpolated end point to measure the normal of the scan point
+    auto end_pt = points[end_idx];
+    if (distances.back() - current_dist > half_baseline) {
+      float target_dist = current_dist + half_baseline;
+      while (distances[end_idx] < target_dist) {
+        end_idx++;
+      }
+
+      float r = half_baseline - (distances[end_idx - 1] - current_dist);
+      float l = distances[end_idx] - distances[end_idx - 1];
+      float w = r / l;
+      end_pt = points[end_idx] * w + (1.0f - w) * points[end_idx - 1];
+    }
+
+    Eigen::Vector2f v = (end_pt - start_pt).normalized();
+    normals.emplace_back(-v[1], v[0]);
+  }
+
+  if (normals.empty()) {
+    ROS_WARN("No valid correspondences in scan!");
+    return {0, 0};
+  }
+
+  Eigen::Map<Eigen::Matrix<float,2,Eigen::Dynamic>> N(normals.data()->data(), 2, normals.size());
+
+  // compute the SVD of the normal vector matrix. if sigma_min << sigma_max,
+  // the pointcloud is degenerate (i.e. uninformative in a given direction)
+  auto svd = N.jacobiSvd(Eigen::ComputeThinU | Eigen::ComputeThinV);
+  auto singular_values = svd.singularValues();
+  int min_idx = 0;
+  int max_idx = 1;
+  float min_val = singular_values(0);
+  float max_val = singular_values(1);
+  if (min_val > max_val) {
+    std::swap(min_idx, max_idx);
+    std::swap(min_val, max_val);
+  }
+
+  if (max_val == 0) {
+    return {0, 0};
+  }
+
+  float degeneracy = std::max(0.0001, 1.0 - std::min(1.0f, min_val / max_val));
+  Eigen::Vector2f primary_axis = svd.matrixU().col(max_idx);
+  primary_axis.normalize();
+
+  Eigen::Vector2f secondary_axis = { -primary_axis[1], primary_axis[0] };
+
+  return secondary_axis * degeneracy;
 }
 
 } // namespace scan_tools
